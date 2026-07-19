@@ -1,0 +1,103 @@
+# ---------------------------------------------------------------------------------------------------------------
+# Flow123d input template: linear elastic buffered cube, static (traction) boundary conditions.
+# Traction depends on the face normal (t = sigma_q @ n), so — unlike KUBC's single displacement
+# formula valid on the whole boundary — each of the 6 outer faces gets its OWN prescribed vector.
+#
+# Placeholders (each used below in angle brackets): mesh_file, cross_section_file, bulk_regions,
+#   fracture_regions, rock_young_modulus, rock_poisson_ratio, fracture_young_modulus,
+#   fracture_poisson_ratio, description, traction_x0, traction_x1, traction_y0, traction_y1,
+#   traction_z0, traction_z1 (each a "[tx, ty, tz]" string, computed in subc.py as sigma_q @ n_face)
+#
+# Regions (see micro_mesh.py make_geometry): box + support_tetras_volume (bulk_regions — SAME
+#   material as rock, per R. Siddall's original static_bc pipeline), fam_<family>_<iii> (one per
+#   fracture), .side_[xyz][01] (outer boundary — traction), .support_origin_[XYZ] /
+#   .support_tetra_one_norm_[YZ] / .support_tetra_two_norm_Z (6 faces on 3 small corner
+#   tetrahedra — the minimal "3-2-1" statically-determinate support removing the 6 rigid-body
+#   modes a pure-traction boundary leaves undetermined; identical for all 6 load cases, so this
+#   block is fixed, not templated). See PLAN.md for why the buffer alone does not replace this.
+# ---------------------------------------------------------------------------------------------------------------
+
+flow123d_version: 4.0.3dev_e651b9
+
+problem: !Coupling_Sequential
+  description: "<description>"
+  mesh:
+    mesh_file: <mesh_file>
+
+  flow_equation: !Coupling_Iterative
+    input_fields:
+      - region: <bulk_regions>
+    time:
+      end_time: 1.0
+    a_tol: 1e-18
+    r_tol: 1e-18
+
+    flow_equation: !Flow_Darcy_LMH
+      gravity: [0, 0, 0]
+      input_fields:
+        - region: <fracture_regions>
+          cross_section: !FieldFE
+            mesh_data_file: <cross_section_file>
+            field_name: cross_section
+
+        - region: <bulk_regions>
+          bc_type: dirichlet
+          bc_pressure: 0
+
+      # schema plumbing ONLY (the vehicle for declaring the cross_section FieldFE above), see
+      # mechanics_kubc_tmpl.yaml's identical note
+      output:
+        fields: []
+
+    mechanics_equation: !Elasticity_Linear
+      output_stream:
+        format: !gmsh
+      output:
+        fields:
+          - displacement
+          - stress
+          - region_id
+          - cross_section_updated
+
+      solver: !Petsc
+        a_tol: 1e-14
+        r_tol: 1e-14
+
+      input_fields:
+        - region: <bulk_regions>
+          young_modulus: <rock_young_modulus>
+          poisson_ratio: <rock_poisson_ratio>
+
+        - region: <fracture_regions>
+          young_modulus: <fracture_young_modulus>
+          poisson_ratio: <fracture_poisson_ratio>
+
+        # minimal "3-2-1" support (see header) — fixed, same for every SUBC load case
+        - region: [.support_origin_X, .support_origin_Y, .support_origin_Z,
+                   .support_tetra_one_norm_Y, .support_tetra_one_norm_Z, .support_tetra_two_norm_Z]
+          bc_type: displacement_n
+          bc_displacement: 0
+
+        - region: .side_x0
+          bc_type: traction
+          bc_traction: <traction_x0>
+
+        - region: .side_x1
+          bc_type: traction
+          bc_traction: <traction_x1>
+
+        - region: .side_y0
+          bc_type: traction
+          bc_traction: <traction_y0>
+
+        - region: .side_y1
+          bc_type: traction
+          bc_traction: <traction_y1>
+
+        - region: .side_z0
+          bc_type: traction
+          bc_traction: <traction_z0>
+
+        - region: .side_z1
+          bc_type: traction
+          bc_traction: <traction_z1>
