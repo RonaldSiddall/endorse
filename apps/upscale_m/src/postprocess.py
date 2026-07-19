@@ -33,15 +33,19 @@ adequacy of this treatment vs the explicit displacement-jump term J is an open q
 Voigt convention (report): sigma = [11, 22, 33, 23, 13, 12]; strain shear rows carry engineering
 shear gamma = 2 eps.
 """
+import os
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import attrs
 import numpy as np
 
+from bgem.gmsh.gmsh_io import GmshIO
 from bgem.upscale.fem import Grid
 from endorse.macro_flow_model import refine_barycenters
-from endorse.mesh_class import Mesh
+from endorse.mesh_class import Mesh, load_mesh
+
+from micro_mesh import MicroMesh
 
 # engineering shear on the Voigt strain shear rows: gamma = 2 eps (report convention)
 ENG_SHEAR = np.array([1.0, 1.0, 1.0, 2.0, 2.0, 2.0])
@@ -167,6 +171,62 @@ class WindowSubdomain:
         return (self.measures * self.intersect_weights) @ element_vec_data[self.el_indices]
 
 
+def _iter_windows(grid: Grid) -> Iterator[Tuple[int, np.ndarray, np.ndarray]]:
+    """
+    Per-window (i_sub, lo_eff, hi_eff) bounds — half-open [lo, hi), topmost grid faces inclusive
+    (module docstring) — the ONE place this tolerance/rim computation lives, shared by
+    average_windows and write_subdomain_meshes so they always select the SAME elements for a
+    given window.
+    """
+    grid_hi = grid.origin + grid.dimensions
+    half = grid.step / 2.0
+    tol = 1e-8 * max(1.0, float(np.max(grid.step)))
+    for i_sub, center in enumerate(grid.barycenters()):
+        lo3, hi3 = center - half, center + half
+        upper_rim = np.isclose(hi3, grid_hi, rtol=0.0, atol=tol)
+        yield i_sub, lo3 - tol, np.where(upper_rim, hi3 + tol, hi3 - tol)
+
+
+def write_subdomain_meshes(micro: MicroMesh, grid: Grid, level: int, aperture_per_r: float,
+                           out_dir: str) -> None:
+    """
+    Diagnostic export (output.write_subdomain_meshes): one filtered .msh per averaging window,
+    containing ONLY the elements WindowSubdomain.create selects for that window (same selection
+    average_windows uses, via the shared _iter_windows bounds) — so a window's effective-tensor
+    report can be paired with exactly the elements it was computed from and inspected directly in
+    GMSH/ParaView, without re-deriving the selection by hand (as was done ad hoc for
+    dfn_test_222_level_3, see PLAN.md 2026-07-17).
+
+    Reads the PRE-SOLVE healed mesh (micro.mesh_file) — geometry only, no Flow123d output needed,
+    so this is the SAME regardless of which BC type's results the report is for. Kept as an
+    explicit, separate call per BC type at the call site (not shared/deduplicated between kubc/
+    and subc/ output) rather than assuming the selection can never differ (R. Siddall, 2026-07-17).
+    """
+    mesh = load_mesh(micro.mesh_file)
+    region_id_field = np.array([el.tags[0] for el in mesh.elements])
+    aperture_by_region_id = micro.aperture_by_region_id(aperture_per_r)
+    gio = mesh.gmsh_io
+    n_sub = int(grid.n_elements)
+
+    for i_sub, lo_eff, hi_eff in _iter_windows(grid):
+        window = WindowSubdomain.create(mesh, region_id_field, micro.bulk_region_id,
+                                        micro.fracture_region_ids, aperture_by_region_id,
+                                        lo_eff, hi_eff, level)
+        keep_tags = {mesh.el_ids[i] for i in window.el_indices}
+        filtered = GmshIO()
+        filtered.nodes = gio.nodes
+        filtered.physical = gio.physical
+        filtered.elements = {eid: el for eid, el in gio.elements.items() if eid in keep_tags}
+
+        if n_sub == 1:
+            out_path = os.path.join(out_dir, "elements.msh")
+        else:
+            ix, iy, iz = np.unravel_index(i_sub, tuple(grid.shape))
+            out_path = os.path.join(out_dir, f"subdomain_{ix}_{iy}_{iz}", "elements.msh")
+        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+        filtered.write(out_path)
+
+
 def average_windows(output_mesh: Mesh, aperture_by_region_id: Dict[int, float],
                     grid: Grid,
                     young_rock: float, poisson_rock: float,
@@ -212,17 +272,11 @@ def average_windows(output_mesh: Mesh, aperture_by_region_id: Dict[int, float],
             stress9[frac_rows].reshape(-1, 3, 3), young_fracture, poisson_fracture).reshape(-1, 9)
 
     # topmost faces of the whole grid stay INCLUSIVE, interior interfaces half-open [lo, hi)
-    grid_hi = grid.origin + grid.dimensions
-    half = grid.step / 2.0
     V_ref = float(np.prod(grid.step))
     results = []
-    for i_window, center in enumerate(grid.barycenters()):
-        lo3, hi3 = center - half, center + half
-        tol = 1e-8 * max(1.0, float(np.max(grid.step)))
-        upper_rim = np.isclose(hi3, grid_hi, rtol=0.0, atol=tol)
+    for i_window, lo_eff, hi_eff in _iter_windows(grid):
         window = WindowSubdomain.create(output_mesh, rid, bulk_region_id, fracture_region_ids,
-                                        aperture_by_region_id, lo3 - tol,
-                                        np.where(upper_rim, hi3 + tol, hi3 - tol), level)
+                                        aperture_by_region_id, lo_eff, hi_eff, level)
         sigma_avg = window.weighted_sum(stress9) / V_ref
         eps_avg = window.weighted_sum(eps9) / V_ref
         results.append((eps_avg.reshape(3, 3), sigma_avg.reshape(3, 3)))

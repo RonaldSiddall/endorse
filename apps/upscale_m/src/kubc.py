@@ -19,7 +19,7 @@ Six independent load states q = 1..6 prescribe u = E_q x on the whole outer boun
 engineering shear (gamma = 2 eps) on the strain shear rows.
 
 Each case runs Flow123d via endorse.common.call_flow with a single parametrized template
-(flow123d_templates/, filename from config key loads.input_template); the displacement formula
+(flow123d_templates/, filename from config key loads.input_template_kubc); the displacement formula
 string is generated from E_q, so additional (e.g. mixed) load states for a least-squares
 identification need no new template.
 """
@@ -107,22 +107,31 @@ def _write_mechanics_vtu(mesh, path: str, cell_fields: Dict[str, np.ndarray],
 @dataclass
 class LoadCaseResult:
     name: str
-    E_prescribed_voigt: np.ndarray   # prescribed strain (Voigt, engineering shear) — input record
+    prescribed_voigt: np.ndarray     # prescribed load (Voigt): strain E (KUBC) or stress sigma
+                                      # (SUBC), engineering shear already applied if strain-type
     eps_voigt: np.ndarray            # measured strain per window, shape (n_windows, 6)
     sigma_voigt: np.ndarray          # measured stress per window, shape (n_windows, 6)
     spatial_file: str                # Flow123d output fields file the averages were read from
 
 
-def make_load_case_result(name: str, E: np.ndarray, per_box, spatial_file: str) -> LoadCaseResult:
+def make_load_case_result(name: str, load_tensor: np.ndarray, per_box, spatial_file: str,
+                          load_is_strain: bool = True) -> LoadCaseResult:
     """
-    Build a LoadCaseResult from one load case's prescribed strain E and average_windows' list of
-    per-window (eps, sigma) 3x3 pairs -- shared by run_kubc (after a real Flow123d solve) and
-    debug_postprocess.main (against cached outputs), single place for the Voigt conversion and
-    engineering shear gamma = 2 eps (report eq. 2.66, bgem tn_to_voigt, order [11,22,33,23,13,12]).
+    Build a LoadCaseResult from one load case's prescribed load (KUBC: strain E; SUBC: stress
+    sigma) and average_windows' list of per-window (eps, sigma) 3x3 pairs -- shared by run_kubc,
+    subc.run_subc (after a real Flow123d solve) and debug_postprocess.main (against cached
+    outputs), single place for the Voigt conversion and engineering shear gamma = 2 eps (report
+    eq. 2.66, bgem tn_to_voigt, order [11,22,33,23,13,12]).
+    `load_is_strain` (default True, so existing KUBC call sites are unaffected) selects whether
+    the PRESCRIBED load gets the engineering-shear factor: correct for a strain Voigt vector,
+    wrong for a stress one (Voigt shear stress has no such factor). The MEASURED eps/sigma are
+    unaffected either way -- strain is always measured from displacement gradients and always
+    gets ENG_SHEAR, regardless of which BC type produced it.
     """
+    scale = ENG_SHEAR if load_is_strain else 1.0
     return LoadCaseResult(
         name=name,
-        E_prescribed_voigt=tn_to_voigt(E[None])[0] * ENG_SHEAR,
+        prescribed_voigt=tn_to_voigt(load_tensor[None])[0] * scale,
         eps_voigt=tn_to_voigt(np.array([e for e, s in per_box])) * ENG_SHEAR,
         sigma_voigt=tn_to_voigt(np.array([s for e, s in per_box])),
         spatial_file=spatial_file,
@@ -186,7 +195,8 @@ def micro_problem(cfg: dotdict, tag: str, load_matrix: np.ndarray,
     boundary_regions = list(cfg.geometry.boundary_regions)
     missing = [r for r in boundary_regions if r not in micro.regions]
     assert not missing, f"geometry.boundary_regions not found in the mesh: {missing}"
-    template_path = os.path.join(_app_dir, "flow123d_templates", cfg.loads.input_template)
+    template_path = os.path.join(_app_dir, "flow123d_templates", cfg.loads.input_template_kubc)
+    case_name = os.path.basename(tag)  # tag is namespaced, e.g. "kubc/pure_normal_E_11"
     with workdir(tag, inputs=[]):
         # NOTE: mesh copied explicitly, not via workdir(inputs=...) — workdir.copy uses src.stem
         # and silently drops the file extension (recorded in PLAN.md questions).
@@ -194,7 +204,7 @@ def micro_problem(cfg: dotdict, tag: str, load_matrix: np.ndarray,
         shutil.copy2(cross_section_abs_path, os.path.basename(cross_section_abs_path))
         # local per-case template copy so the rendered input carries the case name
         # (pure_normal_E_11.yaml, ...), mirroring the original per-case yaml files
-        local_template = f"{tag}_tmpl.yaml"
+        local_template = f"{case_name}_tmpl.yaml"
         shutil.copy2(template_path, local_template)
         params = dict(
             description=f"upscale_m KUBC load {tag}",
@@ -255,8 +265,9 @@ def run_kubc(cfg: dotdict, micro: MicroMesh, grid: Grid) -> List[LoadCaseResult]
 
     results = []
     for name, dir_name, E in load_cases(cfg):
+        tag = f"kubc/{dir_name}"
         print(f"[upscale_m kubc] case {name}: u = {E.tolist()} @ [x, y, z]")
-        per_box, spatial_file = micro_problem(cfg, dir_name, E, micro, grid, level,
+        per_box, spatial_file = micro_problem(cfg, tag, E, micro, grid, level,
                                               aperture_by_region_id)
         results.append(make_load_case_result(name, E, per_box, spatial_file))
         n_sub = len(per_box)

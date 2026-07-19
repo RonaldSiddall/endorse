@@ -205,12 +205,81 @@ def make_fractures(cfg_fractures: dotdict, box) -> FractureSet:
     raise ValueError(f"Unknown fractures.mode: {cfg_fractures.mode!r}")
 
 
-def make_geometry(factory, cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSet):
+def _corner_tetrahedron(factory, corner: np.ndarray, d: float):
     """
-    Outer cube + fractures + named boundary sides; one mutual fragment.
-    Mirrors chodby_trans create_mesh.make_geometry_box (incl. the '.'+side_name boundary
-    regions). Fractures KEEP geometry_gmsh's per-fracture regions fam_<family>_<iii> — endorse
-    fracture_map joins them after healing and uses them for the element -> fracture map.
+    Small support tetrahedron for SUBC's rigid-body-mode removal: one vertex AT an outer-cube
+    `corner`, the other three arms offset by `d` further OUTWARD (same sign as the corner's own
+    coordinate on that axis) along X, Y, Z — same shape as R. Siddall's original static_bc
+    pipeline (Python_scripts/.../generate_static_fracture.py:create_occ_tetrahedron), built here
+    through factory.model (== gmsh.model.occ, the same primitive calls GeometryOCC.make_simplex
+    itself uses) instead of a separate raw-gmsh helper, and generalized to any corner/sign
+    instead of one hand-written call per corner.
+    """
+    sign = np.sign(corner)
+    arms = corner + d * sign * np.eye(3)  # arms[0]=X-arm, arms[1]=Y-arm, arms[2]=Z-arm
+    p_common = factory.model.addPoint(*corner)
+    p_arm = [factory.model.addPoint(*a) for a in arms]
+
+    l_common = [factory.model.addLine(p_common, p_arm[i]) for i in range(3)]
+    l_ring = [factory.model.addLine(p_arm[i], p_arm[(i + 1) % 3]) for i in range(3)]
+
+    def face(loop):
+        return factory.model.addPlaneSurface([factory.model.addCurveLoop(loop)])
+
+    f_z = face([l_common[0], l_ring[0], -l_common[1]])    # {common, armX, armY}: const Z
+    f_x = face([l_common[1], l_ring[1], -l_common[2]])    # {common, armY, armZ}: const X
+    f_y = face([l_common[2], l_ring[2], -l_common[0]])    # {common, armZ, armX}: const Y
+    f_outer = face([-l_ring[0], -l_ring[2], -l_ring[1]])  # {armX, armY, armZ}: outer, unused
+
+    vol = factory.model.addVolume([factory.model.addSurfaceLoop([f_x, f_y, f_z, f_outer])])
+    factory._need_synchronize = True
+    return factory.object(3, vol)
+
+
+def _support_faces(factory, tet, corner: np.ndarray, axis_names: Dict[str, str], tol: float):
+    """
+    After fragmentation, pick out `tet`'s boundary face(s) whose centroid lies in the coordinate
+    plane(s) named by `axis_names` (e.g. {"x": "support_origin_X", ...}) — the SAME axis-aligned
+    faces R. Siddall's original pipeline extracted via a bounding-box query
+    (generate_static_fracture.py:130-135). Done geometrically here since fragment() invalidates
+    any tags recorded before it runs, so pre-fragment face identities can't be tracked directly.
+    """
+    boundary = tet.get_boundary()
+    picked = {}
+    for dim, tag in boundary.dim_tags:
+        face_obj = factory.object(dim, tag)
+        center, mass = face_obj.center_of_mass()
+        if mass == 0:
+            continue
+        for axis, name in axis_names.items():
+            if abs(center["xyz".index(axis)] - corner["xyz".index(axis)]) < tol:
+                picked[name] = face_obj
+    missing = set(axis_names.values()) - picked.keys()
+    assert not missing, f"support face(s) {missing} not found at corner {corner}"
+    return picked
+
+
+# The 3 support corners (3-2-1 scheme: 3+2+1 = 6 constraints = the 6 rigid-body modes), on the
+# OUTER cube's bottom (min-Z) face, named exactly as R. Siddall's original static_bc pipeline.
+def _support_spec(half: float) -> List[Tuple[np.ndarray, Dict[str, str]]]:
+    return [
+        (np.array([-half, -half, -half]),
+         {"x": "support_origin_X", "y": "support_origin_Y", "z": "support_origin_Z"}),
+        (np.array([half, -half, -half]),
+         {"y": "support_tetra_one_norm_Y", "z": "support_tetra_one_norm_Z"}),
+        (np.array([-half, half, -half]),
+         {"z": "support_tetra_two_norm_Z"}),
+    ]
+
+
+def make_geometry(factory, cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSet,
+                  subc_support: bool = False):
+    """
+    Outer cube + fractures + named boundary sides (+ SUBC support tetrahedra, if `subc_support`);
+    one mutual fragment. Mirrors chodby_trans create_mesh.make_geometry_box (incl. the
+    '.'+side_name boundary regions). Fractures KEEP geometry_gmsh's per-fracture regions
+    fam_<family>_<iii> — endorse fracture_map joins them after healing and uses them for the
+    element -> fracture map.
     """
     L_ext = float(cfg_geometry.get("L_ext_factor", 2.0)) * float(cfg_geometry.L_inner)
     box_dims = [L_ext, L_ext, L_ext]
@@ -223,11 +292,25 @@ def make_geometry(factory, cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_se
         geometry_set.append(fr_group)
     else:
         print("[upscale_m mesh] WARNING: empty fracture set, mesh has no fracture regions")
+    n_main = len(geometry_set)
+
+    support_spec = _support_spec(L_ext / 2.0) if subc_support else []
+    d = float(cfg_geometry.get("support_fraction_d", 0.1)) * float(cfg_geometry.L_inner)
+    geometry_set += [_corner_tetrahedron(factory, corner, d) for corner, _ in support_spec]
 
     factory.synchronize()
     fragmented = factory.fragment(*geometry_set, *sides.values())
-    geometry_final = fragmented[:len(geometry_set)]
-    for side_name, side_fr in zip(sides.keys(), fragmented[len(geometry_set):]):
+    geometry_final = fragmented[:n_main]
+
+    if support_spec:
+        support_tets = fragmented[n_main:n_main + len(support_spec)]
+        for (corner, axis_names), tet in zip(support_spec, support_tets):
+            faces = _support_faces(factory, tet, corner, axis_names, tol=1e-9 * L_ext)
+            geometry_final += [f.set_region('.' + name) for name, f in faces.items()]
+        geometry_final.append(factory.group(*support_tets).set_region("support_tetras_volume"))
+
+    side_start = n_main + len(support_spec)
+    for side_name, side_fr in zip(sides.keys(), fragmented[side_start:]):
         geometry_final.append(side_fr.set_region('.' + side_name))
 
     geometry_final = factory.group(*geometry_final)
@@ -262,9 +345,11 @@ def meshing(factory, objects, mesh_filename: str, cfg_mesh: dotdict):
 
 
 def make_gmsh(cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSet,
-              work_dir: str = ".") -> File:
+              work_dir: str = ".", subc_support: bool = False) -> File:
     """
     Geometry + meshing in a fresh gmsh model. Mirrors chodby_trans create_mesh.make_gmsh.
+    `subc_support` adds the SUBC support tetrahedra (see make_geometry) — off by default so the
+    KUBC-only mesh is completely unaffected.
     """
     mesh_name = cfg_mesh.get("mesh_name", "micro_mesh")
     final_mesh_filename = os.path.join(work_dir, mesh_name + ".msh")
@@ -273,7 +358,7 @@ def make_gmsh(cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSe
     factory.geom_options.Tolerance = float(cfg_mesh.get("tolerance", 1e-6))
     factory.geom_options.ToleranceBoolean = float(cfg_mesh.get("tolerance_boolean", 1e-5))
 
-    geometry_final = make_geometry(factory, cfg_geometry, cfg_mesh, fracture_set)
+    geometry_final = make_geometry(factory, cfg_geometry, cfg_mesh, fracture_set, subc_support)
 
     print(f"[upscale_m mesh] meshing: L_ext={cfg_geometry.get('L_ext_factor', 2.0)}*"
           f"{cfg_geometry.L_inner}, step={cfg_mesh.fracture_mesh_step}, "
@@ -308,15 +393,19 @@ def make_heal_mesh(mesh_name: str, mesh_file: File, work_dir: str = ".",
 
 
 def make_mesh(cfg_geometry: dotdict, cfg_mesh: dotdict, fracture_set: FractureSet,
-              work_dir: str = ".") -> File:
+              work_dir: str = ".", subc_support: bool = False) -> File:
     """
     Raw mesh (skipped when the file already exists, as chodby_trans create_mesh.make_mesh)
     + healing. Returns the healed mesh File.
+    NOTE: the file-existence guard above does not know whether a cached mesh was built with
+    `subc_support` — switching loads.bc_type to/from subc on an EXISTING run dir reuses the stale
+    mesh regardless (same staleness class as switching fractures.mode, see mesh_name's own
+    comment in config.yaml); use a fresh RUN_NAME or mesh_name when doing so.
     """
     mesh_name = cfg_mesh.get("mesh_name", "micro_mesh")
     raw_mesh_path = Path(work_dir) / (mesh_name + ".msh")
     if not raw_mesh_path.exists():
-        mesh_file = make_gmsh(cfg_geometry, cfg_mesh, fracture_set, work_dir)
+        mesh_file = make_gmsh(cfg_geometry, cfg_mesh, fracture_set, work_dir, subc_support)
     else:
         mesh_file = File(str(raw_mesh_path))
 
@@ -357,11 +446,15 @@ def make_cross_section_field(healed_file: File, fracture_set: FractureSet, apert
 
 
 def make_micro_mesh(cfg_geometry: dotdict, cfg_mesh: dotdict, cfg_fractures: dotdict,
-                    aperture_per_r: float, work_dir: str = ".") -> MicroMesh:
+                    aperture_per_r: float, work_dir: str = ".",
+                    subc_support: bool = False) -> MicroMesh:
     """
     Fracture set + mesh + healing + the separate cross_section field file (all files written
     into `work_dir`); the region map is read back from the healed mesh itself.
     Top-level equivalent of chodby_trans create_mesh.main.
+    `subc_support` (set for loads.bc_type in {subc, both}): adds the support tetrahedra needed to
+    remove SUBC's rigid-body modes (make_geometry) — the buffer's Saint-Venant decay does NOT
+    substitute for this, see PLAN.md.
     """
     # patch the two real bgem bugs above in place, here rather than at module import time so
     # merely importing micro_mesh has no side effect on bgem process-wide
@@ -374,7 +467,7 @@ def make_micro_mesh(cfg_geometry: dotdict, cfg_mesh: dotdict, cfg_fractures: dot
     L_ext = factor * L
 
     fracture_set = make_fractures(cfg_fractures, [L_ext, L_ext, L_ext])
-    healed_file = make_mesh(cfg_geometry, cfg_mesh, fracture_set, work_dir)
+    healed_file = make_mesh(cfg_geometry, cfg_mesh, fracture_set, work_dir, subc_support)
 
     mesh_name = cfg_mesh.get("mesh_name", "micro_mesh")
     cross_section_path = Path(work_dir) / (mesh_name + "_cross_section.msh")

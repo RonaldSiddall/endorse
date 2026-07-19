@@ -80,16 +80,29 @@ def _write_vector(f, title, symbol, v, title_indent=26):
     f.write("\n\n")
 
 
-def write_all_reports(cfg, micro, grid, results: List["LoadCaseResult"]) -> List[np.ndarray]:
+_BC_REPORT_INFO = {
+    "kubc": ("kinematic boundary conditions", "k", "report_name_kubc"),
+    "subc": ("static boundary conditions", "s", "report_name_subc"),
+}
+
+
+def write_all_reports(cfg, micro, grid, results: List["LoadCaseResult"],
+                      bc_type: str = "kubc") -> List[np.ndarray]:
     """
     Assemble and write the effective-tensor report for every averaging window in `grid` -- single
     source of truth for the tensor-assembly step, used identically by run_upscale.py (after a real
     Flow123d run) and debug_postprocess.py (against cached outputs, no Docker): both already build
     the same `micro`/`grid` beforehand, so recomputing the reports for an existing run needs no
     resimulation, just re-running this loop against the cached mechanics_fields.msh files.
-    Returns the list of C_k matrices, one per window (grid order).
+    `bc_type` ("kubc", default, or "subc") selects the label/symbol (C_k/S_k vs C_s/S_s) AND the
+    report location: report(s) are written under a bc_type/ subdirectory (kubc/ or subc/),
+    alongside that BC type's own case directories (kubc.run_kubc/subc.run_subc — same "kubc/" /
+    "subc/" nesting), so a bc_type: both run keeps everything for each BC type together in one
+    place instead of colliding or scattering the reports at the run root.
+    Returns the list of C_<suffix> matrices, one per window (grid order).
     """
-    report_name = cfg.output.report_name
+    bc_label, symbol_suffix, report_name_key = _BC_REPORT_INFO[bc_type]
+    report_name = cfg.output[report_name_key]
     subdivision = [int(v) for v in cfg.geometry.get("subdomains", [1, 1, 1])]
     geo_radii = micro.fracture_radii
     meta = dict(
@@ -97,6 +110,7 @@ def write_all_reports(cfg, micro, grid, results: List["LoadCaseResult"]) -> List
         L_ext_factor=cfg.geometry.get("L_ext_factor", 2.0),
         subdomains=subdivision,
         beta=cfg.loads.deformation_parameter_beta,
+        alpha=cfg.loads.stress_parameter_alpha,
         E_rock=cfg.materials.young_modulus_rock,
         nu_rock=cfg.materials.poisson_ratio_rock,
         E_fracture=cfg.materials.young_modulus_fracture,
@@ -114,16 +128,17 @@ def write_all_reports(cfg, micro, grid, results: List["LoadCaseResult"]) -> List
         meta_i = dict(meta)
         meta_i["subdomain_box"] = [list(np.round(lo3, 6)), list(np.round(hi3, 6))]
         if n_sub == 1:
-            report_path = report_name
+            report_path = os.path.join(bc_type, report_name)
         else:
             ix, iy, iz = np.unravel_index(i_sub, tuple(grid.shape))
-            report_path = os.path.join(f"subdomain_{ix}_{iy}_{iz}", report_name)
-        write_report(report_path, results, E, Sigma, C_k, meta_i)
+            report_path = os.path.join(bc_type, f"subdomain_{ix}_{iy}_{iz}", report_name)
+        write_report(report_path, results, E, Sigma, C_k, meta_i,
+                    bc_label=bc_label, symbol_suffix=symbol_suffix)
         all_C.append(C_k)
 
         if n_sub == 1:
             with np.printoptions(precision=3, suppress=False, linewidth=140):
-                print("\nC_k:\n", C_k)
+                print(f"\nC_{symbol_suffix}:\n", C_k)
         else:
             ix, iy, iz = np.unravel_index(i_sub, tuple(grid.shape))
             print(f"  subdomain ({ix},{iy},{iz}): "
