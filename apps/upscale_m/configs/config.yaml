@@ -14,20 +14,26 @@ geometry:
     L_inner: 1.0
     # Outer cube edge = L_ext_factor * L_inner. Factor 2.0 => buffer shell L/2 thick on every face.
     # Set to 1.0 to reproduce the unbuffered single-cube RVE
-    L_ext_factor: 2.0
+    L_ext_factor: 1.0
     # Averaging-window grid inside the inner cube: one effective tensor per window, all windows
     # read from the SAME six solutions (mirrors macro_conductivity's per-subdomain tensors).
     # Windows are endorse-side boxes, NOT imprinted in the mesh (elements cut by a window
     # boundary enter with their volume fraction). [1,1,1] = one tensor.
     subdomains: [1, 1, 1]
     # Refinement level for the volume/area-fraction estimate of elements CUT by a window
-    # boundary (bulk via MacroCube.interact, fractures via postprocess._window_weights): each
-    # cut element is split into 8^level (bulk tets) / 4^level (fracture triangles) equal
+    # boundary (both bulk and fracture elements, via postprocess._window_weights): each cut
+    # element is split into 8^level (bulk tets) / 4^level (fracture triangles) equal
     # sub-elements; error ~ 2^-level. One knob for both — level 0 = plain barycenter 0/1 test.
-    window_refine_level: 2
+    window_refine_level: 3
     # Outer-boundary region names (must match endorse mesh_tools.box_with_sides' side keys,
     # prefixed with '.'), substituted into the Flow123d template's <boundary_regions>.
     boundary_regions: [.side_x0, .side_x1, .side_y0, .side_y1, .side_z0, .side_z1]
+    # SUBC only: edge length of the 3 support tetrahedra (as a fraction of L_inner), added at 3
+    # corners of the OUTER cube to remove rigid-body modes under pure traction loading (the
+    # buffer's Saint-Venant decay does NOT substitute for this -- it addresses a different problem,
+    # see PLAN.md). Same value R. Siddall's original static_bc pipeline used (d = 0.1 * L). Ignored
+    # for KUBC (displacement BCs on the whole boundary are never singular).
+    support_fraction_d: 0.1
 
 fractures:
     # 'explicit' (uses explicit_list below) or 'stochastic' (uses stochastic: below, a bgem
@@ -63,6 +69,14 @@ fractures:
                 r_min: 0.2659
                 r_max: 0.5317
                 p_32: 0.3
+            fam_2:
+                trend: 90.0
+                plunge: 0.0
+                concentration: 6.0
+                power: 2.5
+                r_min: 0.2659
+                r_max: 0.5317
+                p_32: 0.3
         # optional (bgem sizes): restrict generated sizes, Population.set_sample_range
         # sample_range: [0.2659, 0.5317]
 
@@ -75,7 +89,7 @@ mesh:
     # target element size on/near fractures and global maximum. 0.1 keeps a single-fracture
     # mesh small; a multi-fracture DFN (mode: stochastic) typically wants this finer (e.g.
     # 0.05) and will take noticeably longer to mesh and to solve.
-    fracture_mesh_step: 0.15
+    fracture_mesh_step: 0.1
     # CharacteristicLengthMin = fracture_mesh_step / mesh_size_min_fraction
     mesh_size_min_fraction: 10.0
     # disc approximation: minimum number of boundary points per full circle (gmsh option
@@ -100,11 +114,12 @@ materials:
     aperture_per_r: 1e-3
 
 loads:
-    # 'kubc', 'subc' or 'both'  (subc pending rigid-body decision, see PLAN.md)
-    bc_type: kubc
-    # Flow123d input template, looked up in flow123d_templates/ (mirrors endorse
+    # 'kubc', 'subc' or 'both'
+    bc_type: both
+    # Flow123d input templates, looked up in flow123d_templates/ (mirrors endorse
     # macro_flow_model.micro_problem's cfg_micro.input_template pattern)
-    input_template: mechanics_kubc_tmpl.yaml
+    input_template_kubc: mechanics_kubc_tmpl.yaml
+    input_template_subc: mechanics_subc_tmpl.yaml
     # KUBC loading parameter beta (dimensionless) and SUBC parameter alpha [Pa]
     deformation_parameter_beta: 1e-2
     stress_parameter_alpha: 1e6
@@ -122,6 +137,12 @@ loads:
         - pure_shear_E_12
 
 output:
-    # Effective-tensor report filename, written once per averaging window (geometry.subdomains)
+    # Effective-tensor report filenames, written once per averaging window (geometry.subdomains)
     # — single file at the run root for [1,1,1], one per subdomain_<ix>_<iy>_<iz>/ otherwise.
-    report_name: effective_tensor_C_k_kinematic_bc.txt
+    report_name_kubc: effective_tensor_C_k_kinematic_bc.txt
+    report_name_subc: effective_tensor_C_s_static_bc.txt
+    # Diagnostic only: also write a filtered elements.msh next to each window's report, containing
+    # ONLY the elements that window's tensor was computed from (same selection average_windows
+    # uses) — inspectable directly in GMSH/ParaView. Off by default: extra I/O per window, most
+    # useful for a multi-window run (geometry.subdomains != [1,1,1]).
+    write_subdomain_meshes: false
