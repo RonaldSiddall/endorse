@@ -15,6 +15,7 @@ For given set of evaluation points, evaluate the properties in these points:
    symmetric tensor from outer product: a2+b1 , a3+c1, b3+c2
 """
 import logging
+from functools import lru_cache
 from typing import *
 import os
 import numpy as np
@@ -81,6 +82,100 @@ class MacroTetra(MacroShapeBase):
         neg_dist = (np.max(x_bary) + micro_r) / (2 * micro_r)
         w = min(1.0, max(0.0, neg_dist))
         return w
+
+
+@lru_cache(maxsize=None)
+def _simplex_barycentric_weights(n_vertices: int, level: int) -> np.ndarray:
+    """
+    Barycentric weights (n_sub, n_vertices) of refine_barycenters' sub-element barycenters,
+    computed once on the reference simplex and mapped to any actual element via
+    `weights @ element_vertices` (affine invariance of barycentric combinations). Needed
+    because refine_element asserts num_vertices == dim + 1 and thus rejects TRIANGLES EMBEDDED
+    IN 3D, although its refinement tables are valid on the (k-1)-dimensional reference simplex
+    the assert holds for.
+    """
+    from .macro_flow_model import refine_barycenters  # local: macro_flow_model imports this module
+    ref_simplex = np.eye(n_vertices)[:, 1:]  # rows: origin + unit vectors, shape (k, k-1)
+    local = refine_barycenters(ref_simplex, level)
+    return np.concatenate([1.0 - local.sum(axis=1, keepdims=True), local], axis=1)
+
+
+def _window_weights(vertices: np.ndarray, lo_eff: np.ndarray, hi_eff: np.ndarray, level: int) -> np.ndarray:
+    """
+    Fraction of each simplex (shape (n_el, k, 3)) inside the half-open window [lo_eff, hi_eff).
+    Exact 1/0 shortcuts (window is convex); elements cut by the window boundary are estimated
+    from the barycenters of refine_barycenters sub-elements. Generic in the vertex count k (3
+    for a triangle, 4 for a tet) via _simplex_barycentric_weights, so the same call estimates
+    the cut-fraction for either element kind.
+    """
+    inside = lambda points: np.all((points > lo_eff) & (points < hi_eff), axis=-1)
+    node_in = inside(vertices)
+    weights = np.zeros(len(vertices))
+    weights[np.all(node_in, axis=1)] = 1.0
+    aabb_out = (np.any(np.min(vertices, axis=1) > hi_eff, axis=1)
+                | np.any(np.max(vertices, axis=1) < lo_eff, axis=1))
+    cut = np.where(~np.all(node_in, axis=1) & ~aabb_out)[0]
+    if cut.size:
+        w_ref = _simplex_barycentric_weights(vertices.shape[1], level)
+        sub_barycenters = np.einsum("sk,nkd->nsd", w_ref, vertices[cut])
+        weights[cut] = np.mean(inside(sub_barycenters), axis=1)
+    return weights
+
+
+@attrs.define
+class _BoxElement:
+    """Minimal Element-like object for ONE axis-aligned box (8 corner vertices) -- lets a
+    single averaging window act as a macro element for Subdomain.create."""
+    _vertices: np.ndarray  # shape (8, 3)
+
+    def vertices(self):
+        return self._vertices
+
+    def barycenter(self):
+        return self._vertices.mean(axis=0)
+
+
+def _box_corners(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
+    """8 corners of an axis-aligned box given its [lo, hi] bounds."""
+    bounds = np.array([lo, hi])
+    return np.array([[bounds[sx, 0], bounds[sy, 1], bounds[sz, 2]]
+                     for sx in (0, 1) for sy in (0, 1) for sz in (0, 1)])
+
+
+class WindowsMacroMesh:
+    """Bridges a bgem Grid of averaging windows into Subdomain.create's macro_mesh interface --
+    one _BoxElement per grid cell, so each window is addressable as elements[i_el]. Interior
+    window interfaces are half-open [lo, hi) (nudged by `tol`) so an element lying exactly on an
+    interface shared by two windows is captured by exactly one of them; the outermost grid rim
+    stays inclusive (nudged outward instead)."""
+    def __init__(self, grid, tol=None):
+        if tol is None:
+            tol = 1e-8 * max(1.0, float(np.max(grid.step)))
+        half = grid.step / 2.0
+        grid_hi = grid.origin + grid.dimensions
+        self.elements = []
+        for center in grid.barycenters():
+            lo, hi = center - half, center + half
+            upper_rim = np.isclose(hi, grid_hi, rtol=0.0, atol=tol)
+            lo_eff = lo - tol
+            hi_eff = np.where(upper_rim, hi + tol, hi - tol)
+            self.elements.append(_BoxElement(_box_corners(lo_eff, hi_eff)))
+
+
+@attrs.define
+class MacroCube(MacroShapeBase):
+    """Axis-aligned box window shape with a proper fractional cut-boundary weight (not just a
+    barycenter-in/out test like MacroSphere/MacroTetra) -- level controls the sub-element
+    refinement of _window_weights."""
+    level: int = 2
+
+    def aabb(self, macro_el: Element):
+        v = macro_el.vertices()
+        return np.array([v.min(axis=0), v.max(axis=0)])
+
+    def interact(self, macro_el: Element, micro_el: Element):
+        lo, hi = self.aabb(macro_el)
+        return _window_weights(micro_el.vertices()[None, :, :], lo, hi, self.level)[0]
 
 
 @attrs.define
@@ -403,10 +498,12 @@ class Subdomain:
     _weights : np.array = None
 
     @staticmethod
-    def create(shape: MacroShapeBase, micro_mesh: Mesh, macro_mesh, i_el):
+    def create(shape: MacroShapeBase, micro_mesh: Mesh, macro_mesh, i_el, dims=(3,)):
         """
         Select elements from the micro mesh interacting with a sphere
-        approximating the macro element `id_el`.
+        approximating the macro element `id_el`. `dims` selects which element
+        dimensions are considered (default: bulk/3D only, as before -- pass e.g.
+        dims=(2, 3) to also include 2D (fracture) elements).
         """
         macro_el = macro_mesh.elements[i_el]
         #center = macro_el.barycenter()
@@ -417,15 +514,16 @@ class Subdomain:
         aabb = shape.aabb(macro_el)
         candidates = micro_mesh.candidate_indices(aabb)
 
-        # keep volumetric elements only
-        bulk_micro_slice = micro_mesh.el_dim_slice(dim=3)
-        candidates = [ie for ie in candidates if bulk_micro_slice.start <= ie < bulk_micro_slice.stop]
+        # keep elements of the requested dimension(s) only
+        el_slices = [micro_mesh.el_dim_slice(dim=dim) for dim in dims]
+        candidates = [ie for ie in candidates
+                      if any(s.start <= ie < s.stop for s in el_slices)]
 
         assert candidates, f"MacroElShape AABB: {i_el} : {aabb} out of subproblem mesh AABB: {repr_aabb(micro_mesh.bih.aabb())}"
         subdomain_indices = [(ie, w) for ie in candidates
                          if (w := shape.interact(macro_el, micro_mesh.elements[ie])) > 0.0]
         logging.info(f"[{i_el}] Subdomain candidates: {len(candidates)}, elements: {len(subdomain_indices)}")
-        assert subdomain_indices, f"Empty subdomain {aabb}, {shape._center_radius(macro_el)} . {[micro_mesh.elements[ie].barycenter() for ie in candidates]}"
+        assert subdomain_indices, f"Empty subdomain {aabb} . {[micro_mesh.elements[ie].barycenter() for ie in candidates]}"
         micro_el_indices, intersect_weights = list(zip(*subdomain_indices))
         # TODO: we should also check, that subdomain is covered by micro elements, otherwise, e.g.
         # porosity and conductivity would be wrong
@@ -455,6 +553,21 @@ class Subdomain:
         #    return avg[0]
         #else:
         return avg
+
+    def weighted_sum(self, element_vec_data: np.array, measures: np.array = None) -> np.array:
+        """
+        Un-normalized weighted sum: sum(measure * intersect_weight * field) -- the un-normalized
+        counterpart of .average() (which divides by the summed measure). `measures` defaults to
+        self.mesh.el_volumes[self.el_indices]; pass an explicit array for a different per-element
+        measure (e.g. an aperture-scaled effective volume for thin 2D elements) -- this class
+        stays agnostic to what the measure physically represents.
+        """
+        if measures is None:
+            measures = self.mesh.el_volumes[self.el_indices]
+        if len(element_vec_data.shape) == 1:
+            element_vec_data = element_vec_data[:, None]
+        sub_domain_vector = element_vec_data[self.el_indices, :]
+        return (measures * np.array(self.intersect_weights)) @ sub_domain_vector
 
 # def micro_response(subdomains):
 #     mesh = GmshIO("output/flow_fields.msh")
