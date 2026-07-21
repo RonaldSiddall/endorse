@@ -31,6 +31,13 @@ def element_compute_volume(all_nodes: np.array, node_indices: List[int]):
     return np.linalg.det(element_loc_mat(all_nodes, node_indices)) / 6
 
 
+#@njit
+def element_compute_area(all_nodes: np.array, node_indices: List[int]):
+    n = element_vertices(all_nodes, node_indices)
+    e1, e2 = n[1] - n[0], n[2] - n[0]
+    return 0.5 * np.linalg.norm(np.cross(e1, e2))
+
+
 @attrs.define
 class Element:
     mesh: 'Mesh'
@@ -46,6 +53,9 @@ class Element:
 
     def volume(self):
         return element_compute_volume(self.mesh.nodes, self.node_indices)
+
+    def area(self):
+        return element_compute_area(self.mesh.nodes, self.node_indices)
 
     def barycenter(self):
         return np.mean(self.vertices(), axis=0)
@@ -185,7 +195,10 @@ class Mesh:
         if self._el_volumes is None:
             logging.info("    element volumes reinit ...")
             self._el_volumes = np.array(
-                [e.volume() if len(e.node_indices) == 4 else 0.0 for e in self.elements],
+                [e.volume() if len(e.node_indices) == 4
+                 else e.area() if len(e.node_indices) == 3
+                 else 0.0
+                 for e in self.elements],
                 dtype=float,
             )
         return self._el_volumes
