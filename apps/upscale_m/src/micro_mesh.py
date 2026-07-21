@@ -122,8 +122,10 @@ class MicroMesh:
 
     @property
     def fracture_region_ids(self) -> List[int]:
-        """Region ids in ALPHABETICAL name order — fine for set/membership use (region
-        classification in WindowSubdomain.create)"""
+        """Region ids in the mesh's own physical-group order (fracture_regions is NOT sorted) —
+        fine for set/membership use (region classification in WindowSubdomain.create), where
+        order is irrelevant; use fracture_radius_by_region_id where order-independent correctness
+        matters (e.g. matching a region to its radius)."""
         return [self.regions[name][0] for name in self.fracture_regions]
 
     @property
@@ -139,14 +141,17 @@ class MicroMesh:
         """
         region id -> geometric radius, correctly matched via the GENERATION index ENCODED IN
         each region's own name (bgem fr_mesh.geometry_gmsh: f"fam_{fr.family}_{i:03d}", i =
-        position in the FractureSet) rather than by position in the alphabetically-sorted
-        fracture_regions list. Naively zipping fracture_region_ids (alphabetical) against
-        fracture_radii (generation order) — as an earlier version of this code and
-        debug_postprocess.py did — silently pairs a fracture with ANOTHER fracture's radius as
-        soon as the two orders diverge: zero-padding to 3 digits keeps alphabetical == numeric
-        order only for indices 0-999, so this first breaks at exactly 1000 fractures, not
+        position in the FractureSet), independent of fracture_regions' own iteration order.
+        Naively zipping fracture_region_ids against fracture_radii (generation order) — as an
+        earlier version of this code and debug_postprocess.py did, when fracture_regions was
+        still alphabetically sorted — silently pairs a fracture with ANOTHER fracture's radius as
+        soon as the two orders diverge: zero-padding to 3 digits kept alphabetical == numeric
+        order only for indices 0-999, so that broke first at exactly 1000 fractures, not
         gradually — confirmed empirically (chatgpt-codex-connector PR review, 2026-07-14): a
         5615-fracture two-family DFN test mismatched 5514/5615 region-to-radius pairs this way.
+        fracture_regions is no longer sorted (J. Brezina PR review), but this method stays: it is
+        correct regardless of fracture_regions' order, so it needs no assumption about what order
+        the mesh happens to declare physical groups in.
         """
         radii = self.fracture_radii
         return {
@@ -477,7 +482,10 @@ def make_micro_mesh(cfg_geometry: dotdict, cfg_mesh: dotdict, cfg_fractures: dot
 
     # physical name -> (region id, dim), authoritative for postprocess element selection
     regions = dict(gmsh_io.GmshIO(healed_file.path).physical)
-    fracture_regions = sorted(n for n in regions if n.startswith("fam_"))
+    # NOT sorted (J. Brezina PR review): keep the mesh's own physical-group order rather than
+    # imposing a lexicographic one (which breaks fam_<family>_<iii> at 1000+ fractures per family,
+    # see fracture_radius_by_region_id below).
+    fracture_regions = [n for n in regions if n.startswith("fam_")]
 
     return MicroMesh(
         mesh_file=healed_file,
