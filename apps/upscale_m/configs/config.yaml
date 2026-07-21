@@ -14,7 +14,7 @@ geometry:
     L_inner: 1.0
     # Outer cube edge = L_ext_factor * L_inner. Factor 2.0 => buffer shell L/2 thick on every face.
     # Set to 1.0 to reproduce the unbuffered single-cube RVE
-    L_ext_factor: 1.0
+    L_ext_factor: 2.0
     # Averaging-window grid inside the inner cube: one effective tensor per window, all windows
     # read from the SAME six solutions (mirrors macro_conductivity's per-subdomain tensors).
     # Windows are endorse-side boxes, NOT imprinted in the mesh (elements cut by a window
